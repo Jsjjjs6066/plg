@@ -1,27 +1,25 @@
 # Playlists with Git (PLG)
 Tool for syncing playlists of music files from a remote server with Git.
 
-<p align="center">
-    ![Coat of arms of PLG](https://raw.githubusercontent.com/Jsjjjs6066/plg/master/assets/plg.png)
-</p>
+![Coat of arms of PLG](https://raw.githubusercontent.com/Jsjjjs6066/plg/master/assets/plg.png)
 
 # Basic usage:
 > [!NOTE]
 > Keep in mind that quotes are not needed for one word. Quotes my be used even when not needed. Use quotes if you are unsure how your shell will interpret it. 
-Intialize a repository and push all files inside it to a remote:
+Initialize a repository and push all files inside it to a remote:
 ```
 plg init --name <PLAYLIST NAME> <REMOTE REPOSITORY>
 ```
-## Example:
+Example:
 ```
 plg init --name "My playlist" "https://github.com/Jsjjjs6066/playlist"
 ```
 ---
-Update local playlist, download a song from Youtube (Music) and push it with all other changes to the remote:
+Update local playlist, download a song from YouTube (Music) and push it with all other changes to the remote:
 ```
 plg add <LINK TO A YOUTUBE VIDEO/SONG>
 ```
-## Example:
+Example:
 ```
 plg add "https://www.youtube.com/watch?v=JatTfrdDgn0"
 ```
@@ -72,7 +70,7 @@ Specify the music player to open the playlist in this time:
 ```
 plg play <PATH TO YOUR PLAYER>
 ```
-## Example:
+Example:
 ```
 plg play vlc
 ```
@@ -81,16 +79,16 @@ Set the default music player:
 ```
 plg cfg --default-player <PATH TO YOUR PLAYER>
 ```
-## Example:
+Example:
 ```
 plg cfg --default-player vlc
 ```
 ---
-Download from Youtube (Music) without updating and pushing:
+Download from YouTube (Music) without updating and pushing:
 ```
 plg download <LINK TO A YOUTUBE VIDEO/SONG>
 ```
-## Example:
+Example:
 ```
 plg download "https://www.youtube.com/watch?v=JatTfrdDgn0"
 ```
@@ -104,7 +102,7 @@ Generate completions for your shell for easier use:
 ```
 plg completions <SHELL>
 ```
-## Example:
+Example:
 ```
 plg completions bash
 ```
