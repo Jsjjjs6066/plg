@@ -1,0 +1,34 @@
+[package]
+name = "plg"
+version = "1.0.0"
+edition = "2024"
+description = "Tool for syncing playlists with Git."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Jsjjjs6066/plg"
+keywords = ["git", "playlist", "playlists", "music", "sync"]
+categories = ["command-line-utilities", "multimedia::audio"]
+authors = ["Leon Žlender"]
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+directories = "6.0.0"
+git2 = { version = "0.21.0", features = ["https", "ssh"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+chrono = { version = "0.4", features = ["serde"] }
+serde_with = { version = "3.0", features = ["chrono"] } 
+clap_complete = "4.6.9"
+
+[build-dependencies]
+winres = "0.1"
+
+[package.metadata.packager]
+name = "PLG"
+identifier = "hr.from.leon-zlender.plg"
+version = "1.0.0"
+authors = ["Leon Žlender"]
+description = "Tool for syncing playlists with Git."
+icons = ["assets/plg.ico", "assets/plg.icns", "assets/plg256x256.png"]
+before-packaging-command = "cargo build --release"
+
