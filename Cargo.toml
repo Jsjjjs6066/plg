@@ -32,3 +32,5 @@ description = "Tool for syncing playlists with Git."
 icons = ["assets/plg.ico", "assets/plg.icns", "assets/plg256x256.png"]
 before-packaging-command = "cargo build --release"
 
+[package.metadata.winres]
+

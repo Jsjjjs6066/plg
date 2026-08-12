@@ -41,6 +41,7 @@ pub struct Config {
     pub default_player: Option<String>,
     pub last_updated: Option<NaiveDateTime>,
     pub update_cooldown_m: Option<u16>,
+    pub disable_update_on_play: Option<bool>,
 }
 
 impl Default for Config {
@@ -49,6 +50,7 @@ impl Default for Config {
             default_player: None,
             last_updated: None,
             update_cooldown_m: Some(3 * 60),
+            disable_update_on_play: None,
         }
     }
 }
@@ -111,7 +113,7 @@ enum Cmds {
         remote: String,
     },
     #[command(long_about)]
-    /// Just download music from Youtube (Music) without updating or pushing.
+    /// Just download music from Youtube (Music) without updating and pushing.
     Download {
         /// URL to download the music from.
         url: String,
@@ -168,6 +170,9 @@ enum Cmds {
         /// Sets the update cooldown in hours. Can be combined with minutes: `plg cfg
         /// --update-cooldown-h 2 --update-cooldown-m 30`.
         update_cooldown_h: Option<u8>,
+        #[arg(long)]
+        /// Disables automatic updating when playing.
+        disable_update_on_play: Option<bool>,
     },
     #[command(long_about)]
     /// Resets the specified global settings to default values.
@@ -178,7 +183,10 @@ enum Cmds {
         #[arg(long)]
         /// Update cooldown: by default does not update the local repository until the cooldown
         /// passes if not planning to write changes to the repository.
-        update_cooldown: bool
+        update_cooldown: bool,
+        #[arg(long)]
+        /// Disables automatic updating when playing.
+        disable_update_on_play: bool,
     },
     #[command(long_about)]
     /// Print the global settings
@@ -274,9 +282,14 @@ fn run() -> io::Result<LogOptions> {
             if !no_update {
                 if let Ok(ref r) = repo() {
                     let mut cfg = load_config().unwrap_or_default();
-                    update(&mut cfg, r, false, force_update, lo)?;
-                    if let Err(e) = save_config(&cfg) {
-                        return Err(io::Error::other(format!("Unable to load config: {e}")));
+                    if !cfg.disable_update_on_play.unwrap_or_default() {
+                        update(&mut cfg, r, false, force_update, lo)?;
+                        if let Err(e) = save_config(&cfg) {
+                            return Err(io::Error::other(format!("Unable to load config: {e}")));
+                        }
+                    }
+                    else {
+                        println!("Updates on play are disabled.");
                     }
                 }
                 else {
@@ -308,7 +321,7 @@ fn run() -> io::Result<LogOptions> {
                 }
             }
         },
-        Cmds::Cfg { default_player, update_cooldown_m, update_cooldown_h } => {
+        Cmds::Cfg { default_player, update_cooldown_m, update_cooldown_h, disable_update_on_play } => {
             let mut cfg = load_config().unwrap_or_default();
 
             if let Some(player) = default_player {
@@ -321,11 +334,15 @@ fn run() -> io::Result<LogOptions> {
                 cfg.update_cooldown_m = Some(60 * h as u16 + m as u16);
             }
 
+            if let Some(b) = disable_update_on_play {
+                cfg.disable_update_on_play = Some(b);
+            }
+
             if let Err(e) = save_config(&cfg) {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
         },
-        Cmds::Reset { default_player, update_cooldown } => {
+        Cmds::Reset { default_player, update_cooldown, disable_update_on_play } => {
             let mut cfg = load_config().unwrap_or_default();
 
             if default_player {
@@ -334,6 +351,10 @@ fn run() -> io::Result<LogOptions> {
 
             if update_cooldown {
                 cfg.update_cooldown_m = Some(3 * 60);
+            }
+
+            if disable_update_on_play {
+                cfg.disable_update_on_play = None;
             }
 
             if let Err(e) = save_config(&cfg) {
