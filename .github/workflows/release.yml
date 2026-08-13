@@ -7,6 +7,10 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Enter the name of an already existing tag'
+        required: true
 
 permissions:
   contents: write
@@ -73,6 +77,7 @@ jobs:
     - name: Upload Artifacts to GitHub Release
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ github.event.inputs.tag_name || github.ref_name }}
         files: |
           target/${{ matrix.target }}/release/plg
           target/${{ matrix.target }}/release/plg.exe

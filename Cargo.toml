@@ -14,7 +14,7 @@ build = "build.rs"
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 directories = "6.0.0"
-git2 = { version = "0.21.0", features = ["https", "ssh"] }
+git2 = { version = "0.21.0", features = ["https", "ssh", "vendored-openssl"] }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.4"
 chrono = { version = "0.4", features = ["serde"] }
