@@ -9,6 +9,7 @@ repository = "https://github.com/Jsjjjs6066/plg"
 keywords = ["git", "playlist", "playlists", "music", "sync"]
 categories = ["command-line-utilities", "multimedia::audio"]
 authors = ["Leon Žlender"]
+build = "build.rs"
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -21,7 +22,7 @@ serde_with = { version = "3.0", features = ["chrono"] }
 clap_complete = "4.6.9"
 
 [build-dependencies]
-winres = "0.1"
+embed-resource = "2.5"
 
 [package.metadata.packager]
 name = "PLG"
@@ -31,8 +32,6 @@ authors = ["Leon Žlender"]
 description = "Tool for syncing playlists with Git."
 icons = ["assets/plg.ico", "assets/plg.icns", "assets/plg256x256.png"]
 before-packaging-command = "cargo build --release"
-
-[package.metadata.winres]
 
 [profile.release]
 opt-level = "s"
