@@ -34,3 +34,6 @@ before-packaging-command = "cargo build --release"
 
 [package.metadata.winres]
 
+[profile.release]
+opt-level = "s"
+lto = true  
