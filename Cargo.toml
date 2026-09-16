@@ -10,6 +10,7 @@ keywords = ["git", "playlist", "playlists", "music", "sync"]
 categories = ["command-line-utilities", "multimedia::audio"]
 authors = ["Leon Žlender"]
 build = "build.rs"
+autobins = false
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
@@ -20,6 +21,13 @@ toml = "1.1.4"
 chrono = { version = "0.4", features = ["serde"] }
 serde_with = { version = "3.0", features = ["chrono"] } 
 clap_complete = "4.6.9"
+qtrs = { version = "0.5.8", optional = true }
+
+[features]
+cli = []
+qt = ["cli", "dep:qtrs"]
+
+default = ["cli"]
 
 [build-dependencies]
 embed-resource = "2.5"
@@ -36,3 +44,13 @@ before-packaging-command = "cargo build --release"
 [profile.release]
 opt-level = "s"
 lto = true  
+
+[[bin]]
+name = "plg"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "plg-qt"
+path = "src/main.rs"
+required-features = ["qt"]

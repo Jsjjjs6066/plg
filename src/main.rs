@@ -1,11 +1,16 @@
+#[cfg(feature = "qt")]
+pub mod desktop;
+
 use chrono::{NaiveDateTime, TimeDelta};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use git2::Repository;
-use plg::{download, init, log, cwd, repo, LogOptions, pull, add_and_push};
-use std::{fs, io, process::{Command, ExitCode, Stdio}};
-use serde::{Deserialize, Serialize};
 use directories::ProjectDirs;
+use git2::Repository;
+use plg::{LogOptions, add_and_push, cwd, download, init, log, pull, repo};
+use serde::{Deserialize, Serialize};
+use std::{
+    ffi::OsStr, fs, io, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}
+};
 
 fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let path = config_path();
@@ -36,6 +41,74 @@ fn config_path() -> std::path::PathBuf {
         .join("config.toml")
 }
 
+pub(crate) fn shortcut_name_is_valid(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name != "."
+        && name != ".."
+        && Path::new(name).file_name() == Some(OsStr::new(name))
+}
+
+fn create_shortcut(name: &str, output_dir: Option<PathBuf>, lo: LogOptions) -> io::Result<()> {
+    if !shortcut_name_is_valid(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Shortcut name must be a simple file name.",
+        ));
+    }
+
+    let output_dir = output_dir.unwrap_or_else(cwd);
+    fs::create_dir_all(&output_dir)?;
+    let executable = std::env::current_exe()?;
+    let playlist_dir = cwd();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = output_dir.join(format!("{name}.desktop"));
+        let escape_value = |value: &str| value.replace(['\n', '\r'], " ");
+        let escape_exec = |value: &str| {
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`")
+        };
+        let contents = format!(
+            "[Desktop Entry]\nType=Application\nName={}\nComment=Open playlist with PLG\nExec=\"{}\" play\nPath={}\nIcon=plg\nTerminal=false\n",
+            escape_value(name),
+            escape_exec(&executable.to_string_lossy()),
+            escape_value(&playlist_dir.to_string_lossy()),
+        );
+        fs::write(&path, contents)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        log!(lo, "Created shortcut at {}", path.display());
+    }
+
+    #[cfg(windows)]
+    {
+        let path = output_dir.join(format!("{name}.bat"));
+        let quote = |value: &str| format!("\"{}\"", value.replace('"', "\"\""));
+        let contents = format!(
+            "@echo off\ncd /d {}\n{} play\n",
+            quote(&playlist_dir.to_string_lossy()),
+            quote(&executable.to_string_lossy()),
+        );
+        fs::write(&path, contents)?;
+        log!(lo, "Created shortcut at {}", path.display());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (executable, playlist_dir);
+        return Err(io::Error::other(
+            "Shortcut generation is not supported on this platform.",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub default_player: Option<String>,
@@ -58,12 +131,17 @@ impl Default for Config {
 #[derive(Parser)]
 #[command(
     name = "Playlists with Git (PLG)",
-    version="1.0.0\nAuthored by Leon Žlender", 
-    author="Leon Žlender",
-    about="Tool for syncing playlists with Git.", 
-    long_about="Tool for syncing playlists of music files from a remote server with Git.", 
+    version = "1.0.0\nAuthored by Leon Žlender",
+    author = "Leon Žlender",
+    about = "Tool for syncing playlists with Git.",
+    long_about = "Tool for syncing playlists of music files from a remote server with Git."
 )]
 struct Cli {
+    #[cfg(feature = "qt")]
+    #[command(subcommand)]
+    command: Option<Cmds>,
+    
+    #[cfg(all(feature = "cli", not(feature = "qt")))]
     #[command(subcommand)]
     command: Cmds,
     #[arg(short, long)]
@@ -139,7 +217,7 @@ enum Cmds {
         force_push: bool,
         #[arg(short, long)]
         /// Commit message to be displayed when looking at the commits.
-        msg: String,
+        msg: Option<String>,
     },
     #[command(long_about)]
     /// Open the playlist in the default or specified music player.
@@ -201,37 +279,46 @@ enum Cmds {
         #[arg(value_enum)]
         shell: Shell,
     },
+    #[command(long_about)]
+    /// Generatea shortcut to current playlist.
+    Shortcut {
+        /// Name of the shortcut.
+        name: String,
+        #[arg(long)]
+        /// Path to the output directory. Uses the current directory if nothing is supplied.
+        output_dir: Option<PathBuf>,
+    },
 }
 
-fn update(cfg: &mut Config, repo: &Repository, ignore_cfg: bool, force: bool, lo: LogOptions) -> io::Result<()> {
+fn update(
+    cfg: &mut Config,
+    repo: &Repository,
+    ignore_cfg: bool,
+    force: bool,
+    lo: LogOptions,
+) -> io::Result<()> {
     let now = chrono::Utc::now().naive_utc();
-    if ((now - TimeDelta::minutes(cfg.update_cooldown_m.unwrap_or_default() as i64)) >= cfg.last_updated.unwrap_or_default()) || ignore_cfg {
+    if ((now - TimeDelta::minutes(cfg.update_cooldown_m.unwrap_or_default() as i64))
+        >= cfg.last_updated.unwrap_or_default())
+        || ignore_cfg
+    {
         pull(repo, force, lo)?;
         cfg.last_updated = Some(chrono::Utc::now().naive_utc());
     }
     else {
-        println!("Skipping update. Force an update by using `plg update`.");
+        log!(lo, "Skipping update. Force an update by using `plg update`.");
     }
     Ok(())
 }
 
-fn run() -> io::Result<LogOptions> {
-    let args = Cli::parse();
-    use LogOptions::*;
-    let lo: LogOptions = if args.quiet {
-        Quiet 
-    }
-    else {
-        if args.verbose {
-            Verbose
-        }
-        else {
-            Normal
-        }
-    };
-
-    match args.command {
-        Cmds::Init { ref name, force_push: force, reinit, ref remote } => {
+fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
+    match args {
+        Cmds::Init {
+            ref name,
+            force_push: force,
+            reinit,
+            ref remote,
+        } => {
             if reinit {
                 log!(v lo, "Removing current Git repository...");
                 let _ = fs::remove_dir_all(cwd().join(".git"));
@@ -240,8 +327,14 @@ fn run() -> io::Result<LogOptions> {
             log!(v lo, "Initializing playlist...");
             init(name.as_deref(), force, remote, lo)?;
             log!(v lo, "Initialized playlist");
-        },
-        Cmds::Add { no_update: no_update_local, force_update: force_update_local, force_push: force_update_remote, ref msg, ref url } => {
+        }
+        Cmds::Add {
+            no_update: no_update_local,
+            force_update: force_update_local,
+            force_push: force_update_remote,
+            ref msg,
+            ref url,
+        } => {
             let repo = repo()?;
             if !no_update_local {
                 let mut cfg = load_config().unwrap_or_default();
@@ -256,18 +349,23 @@ fn run() -> io::Result<LogOptions> {
                 None => "No message supplied by the user.",
             };
             add_and_push(&repo, m, force_update_remote, lo)?;
-        },
+        }
         Cmds::Download { ref url } => {
             download(url, lo)?;
-        },
+        }
         Cmds::Update { force } => {
             let mut cfg = load_config().unwrap_or_default();
             update(&mut cfg, &repo()?, true, force, lo)?;
             if let Err(e) = save_config(&cfg) {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
-        },
-        Cmds::Push { no_update: no_update_local, force_update: force_update_local, force_push: force_update_remote, ref msg } => {
+        }
+        Cmds::Push {
+            no_update: no_update_local,
+            force_update: force_update_local,
+            force_push: force_update_remote,
+            ref msg,
+        } => {
             let repo = repo()?;
             if !no_update_local {
                 let mut cfg = load_config().unwrap_or_default();
@@ -276,9 +374,15 @@ fn run() -> io::Result<LogOptions> {
                     return Err(io::Error::other(format!("Unable to load config: {e}")));
                 }
             }
-            add_and_push(&repo, msg, force_update_remote, lo)?;
+            let message = msg.as_deref().unwrap_or("No message supplied by the user.");
+            add_and_push(&repo, message, force_update_remote, lo)?;
         }
-        Cmds::Play { no_update, force_update, ref player, ref args } => {
+        Cmds::Play {
+            no_update,
+            force_update,
+            ref player,
+            ref args,
+        } => {
             if !no_update {
                 if let Ok(ref r) = repo() {
                     let mut cfg = load_config().unwrap_or_default();
@@ -287,12 +391,10 @@ fn run() -> io::Result<LogOptions> {
                         if let Err(e) = save_config(&cfg) {
                             return Err(io::Error::other(format!("Unable to load config: {e}")));
                         }
+                    } else {
+                        log!(lo, "Updates on play are disabled.");
                     }
-                    else {
-                        println!("Updates on play are disabled.");
-                    }
-                }
-                else {
+                } else {
                     log!(lo, "Repository not found. Skipping update.");
                 }
             }
@@ -304,7 +406,8 @@ fn run() -> io::Result<LogOptions> {
                     .stderr(Stdio::null())
                     .stdin(Stdio::null())
                     .spawn()?;
-            }
+                std::process::exit(0);
+            } 
             else {
                 let cfg = load_config().unwrap_or_default();
                 if let Some(p) = cfg.default_player {
@@ -315,13 +418,21 @@ fn run() -> io::Result<LogOptions> {
                         .stderr(Stdio::null())
                         .stdin(Stdio::null())
                         .spawn()?;
+                    std::process::exit(0);
                 }
                 else {
-                    return Err(io::Error::other("Player not specified. Use `plg play <PLAYER>` to use it or `plg cfg --set-default-player <PLAYER>` to set it as a default player so you can only type `plg play`."));
+                    return Err(io::Error::other(
+                        "Player not specified. Use `plg play <PLAYER>` to use it or `plg cfg --set-default-player <PLAYER>` to set it as a default player so you can only type `plg play`.",
+                    ));
                 }
             }
-        },
-        Cmds::Cfg { default_player, update_cooldown_m, update_cooldown_h, disable_update_on_play } => {
+        }
+        Cmds::Cfg {
+            default_player,
+            update_cooldown_m,
+            update_cooldown_h,
+            disable_update_on_play,
+        } => {
             let mut cfg = load_config().unwrap_or_default();
 
             if let Some(player) = default_player {
@@ -341,8 +452,12 @@ fn run() -> io::Result<LogOptions> {
             if let Err(e) = save_config(&cfg) {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
-        },
-        Cmds::Reset { default_player, update_cooldown, disable_update_on_play } => {
+        }
+        Cmds::Reset {
+            default_player,
+            update_cooldown,
+            disable_update_on_play,
+        } => {
             let mut cfg = load_config().unwrap_or_default();
 
             if default_player {
@@ -360,27 +475,58 @@ fn run() -> io::Result<LogOptions> {
             if let Err(e) = save_config(&cfg) {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
-        },
+        }
         Cmds::ShowCfg => {
             println!("{:#?}", load_config().unwrap_or_default());
-        },
+        }
         Cmds::ResetAll => {
             if let Err(e) = save_config(&Default::default()) {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
-        },
+        }
         Cmds::Completions { shell } => {
             generate(shell, &mut Cli::command(), "plg", &mut io::stdout());
+        }
+        Cmds::Shortcut { name, output_dir } => {
+            create_shortcut(&name, output_dir, lo)?;
         }
     }
     Ok(lo)
 }
 
 fn main() -> ExitCode {
-    let err = run();
-    if let Err(e) = err {
-        eprintln!("Error: {}", e.to_string());
-        return ExitCode::from(e.raw_os_error().unwrap_or(1).try_into().unwrap_or(255));
+    use LogOptions::*;
+    
+    let args = Cli::parse();
+    let lo: LogOptions = if args.quiet {
+        Quiet
     }
-    ExitCode::SUCCESS
+    else {
+        if args.verbose { Verbose } else { Normal }
+    };
+
+    #[cfg(feature = "qt")] {
+        if let Some(a) = args.command {
+            let err = run(a, lo);
+            if let Err(e) = err {
+                eprintln!("Error: {}", e.to_string());
+                return ExitCode::from(e.raw_os_error().unwrap_or(1).try_into().unwrap_or(255));
+            }
+            return ExitCode::SUCCESS;
+        }
+        else {
+            let cfg = load_config().unwrap_or_default();
+            desktop::run(&cfg, lo);
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    #[cfg(all(feature = "cli", not(feature = "qt")))] {
+        let err = run(args.command, lo);
+        if let Err(e) = err {
+            eprintln!("Error: {}", e.to_string());
+            return ExitCode::from(e.raw_os_error().unwrap_or(1).try_into().unwrap_or(255));
+        }
+        return ExitCode::SUCCESS;
+    }
 }

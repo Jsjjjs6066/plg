@@ -1,5 +1,53 @@
-use git2::{Cred, FetchOptions, IndexAddOption, PushOptions, RemoteCallbacks, Repository, build::CheckoutBuilder };
-use std::{io, env::current_dir, path::PathBuf};
+use git2::{
+    Cred, FetchOptions, IndexAddOption, PushOptions, RemoteCallbacks, Repository,
+    build::CheckoutBuilder,
+};
+use std::{
+    env::current_dir,
+    fmt::Display,
+    io::{self, Read},
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{Arc, OnceLock, RwLock},
+    thread,
+};
+
+type LogSink = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+
+static LOG_SINK: OnceLock<RwLock<Option<LogSink>>> = OnceLock::new();
+
+pub fn set_log_sink(sink: Option<LogSink>) {
+    *LOG_SINK.get_or_init(|| RwLock::new(None)).write().unwrap() = sink;
+}
+
+pub fn emit_log(level: LogOptions, message: impl Display) {
+    let message = format!("{message}\n");
+    if let Some(sink) = LOG_SINK
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap()
+        .as_ref()
+        .cloned()
+    {
+        sink(&message);
+    } else if level > LogOptions::Quiet {
+        print!("{message}");
+    }
+}
+
+pub fn emit_process_output(output: &str) {
+    if let Some(sink) = LOG_SINK
+        .get_or_init(|| RwLock::new(None))
+        .read()
+        .unwrap()
+        .as_ref()
+        .cloned()
+    {
+        sink(output);
+    } else {
+        print!("{output}");
+    }
+}
 
 #[repr(u8)]
 #[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
@@ -23,10 +71,14 @@ impl LogOptions {
 #[macro_export]
 macro_rules! log {
     ($q:expr, $($ar:tt)*) => {
-        if $q > LogOptions::Quiet { println!($($ar)*) };
+        if $q > $crate::LogOptions::Quiet {
+            $crate::emit_log($q, format_args!($($ar)*));
+        }
     };
     (v $q:expr, $($ar:tt)*) => {
-        if $q == LogOptions::Verbose { println!($($ar)*) };
+        if $q == $crate::LogOptions::Verbose {
+            $crate::emit_log($q, format_args!($($ar)*));
+        }
     };
 }
 
@@ -35,10 +87,37 @@ pub fn cwd() -> PathBuf {
 }
 
 pub fn run_yt_dlp(args: &[&str]) -> io::Result<bool> {
-    Ok(std::process::Command::new("yt-dlp")
+    let mut child = Command::new("yt-dlp")
         .args(args)
-        .status()?
-        .success())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_thread = thread::spawn(move || forward_process_output(stdout));
+    let stderr_thread = thread::spawn(move || forward_process_output(stderr));
+
+    let status = child.wait()?;
+    stdout_thread
+        .join()
+        .map_err(|_| io::Error::other("yt-dlp stdout reader failed"))??;
+    stderr_thread
+        .join()
+        .map_err(|_| io::Error::other("yt-dlp stderr reader failed"))??;
+
+    Ok(status.success())
+}
+
+fn forward_process_output<R: Read>(mut reader: R) -> io::Result<()> {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        emit_process_output(&String::from_utf8_lossy(&buffer[..count]));
+    }
 }
 
 pub fn download(url: &str, lo: LogOptions) -> io::Result<()> {
@@ -46,8 +125,7 @@ pub fn download(url: &str, lo: LogOptions) -> io::Result<()> {
         if !run_yt_dlp(&["-U", f])? {
             return Err(io::Error::other("yt-dlp update failed"));
         }
-    }
-    else {
+    } else {
         if !run_yt_dlp(&["-U"])? {
             return Err(io::Error::other("yt-dlp update failed"));
         }
@@ -56,15 +134,19 @@ pub fn download(url: &str, lo: LogOptions) -> io::Result<()> {
     log!(lo, "Downloading...");
     if !run_yt_dlp(&[
         lo.get_flag().unwrap_or("--quiet"),
-        "--cookies-from-browser", "firefox",
-        "-f", "ba",
+        "--cookies-from-browser",
+        "firefox",
+        "-f",
+        "ba",
         "-x",
-        "--audio-format", "mp3",
+        "--audio-format",
+        "mp3",
         "--no-write-subs",
         "--no-write-thumbnail",
         "--add-metadata",
         "--embed-metadata",
-        "-o", "%(title)s.%(ext)s",
+        "-o",
+        "%(title)s.%(ext)s",
         url,
     ])? {
         return Err(io::Error::other("yt-dlp download failed"));
@@ -78,8 +160,7 @@ pub fn readme(name: Option<&str>, lo: LogOptions) {
     log!(v lo, "Writing to README.md...");
     if let Some(s) = name {
         let _ = std::fs::write("README.md", format!("{s}: Playlist with Git"));
-    }
-    else {
+    } else {
         let _ = std::fs::write("README.md", "Playlist with Git");
     }
     log!(v lo, "Wrote to README.md");
@@ -95,12 +176,19 @@ pub fn repo() -> io::Result<Repository> {
 
 pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io::Result<()> {
     if let Ok(_) = repo() {
-        return Err(io::Error::other("Git repository already exists, try adding the `--reinit` flag"));
+        return Err(io::Error::other(
+            "Git repository already exists, try adding the `--reinit` flag",
+        ));
     }
     log!(v lo, "Initializing Git repository...");
     let repo = match Repository::init(cwd()) {
         Ok(repo) => repo,
-        Err(e) => return Err(io::Error::other(format!("Failed to initialize repository: {}", e))),
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "Failed to initialize repository: {}",
+                e
+            )));
+        }
     };
     log!(v lo, "Initialized Git repository");
 
@@ -109,10 +197,7 @@ pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io
     let mut index = match repo.index() {
         Ok(i) => i,
         Err(e) => {
-            return Err(io::Error::other(format!(
-                "Failed to get index: {}",
-                e
-            )));
+            return Err(io::Error::other(format!("Failed to get index: {}", e)));
         }
     };
 
@@ -128,30 +213,21 @@ pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io
 
     log!(v lo, "Committing files to Git repository...");
     if let Err(e) = index.write() {
-        return Err(io::Error::other(format!(
-            "Failed to write index: {}",
-            e
-        )));
+        return Err(io::Error::other(format!("Failed to write index: {}", e)));
     }
 
     // Create the tree from the index
     let tree_id = match index.write_tree() {
         Ok(id) => id,
         Err(e) => {
-            return Err(io::Error::other(format!(
-                "Failed to write tree: {}",
-                e
-            )));
+            return Err(io::Error::other(format!("Failed to write tree: {}", e)));
         }
     };
 
     let tree = match repo.find_tree(tree_id) {
         Ok(tree) => tree,
         Err(e) => {
-            return Err(io::Error::other(format!(
-                "Failed to find tree: {}",
-                e
-            )));
+            return Err(io::Error::other(format!("Failed to find tree: {}", e)));
         }
     };
 
@@ -174,10 +250,7 @@ pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io
         &tree,
         &[],
     ) {
-        return Err(io::Error::other(format!(
-            "Failed to create commit: {}",
-            e
-        )));
+        return Err(io::Error::other(format!("Failed to create commit: {}", e)));
     }
     log!(v lo, "Committed files to Git repository");
 
@@ -195,15 +268,13 @@ pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io
 
     if let Ok(branch_name) = head.shorthand() {
         if branch_name != "master" {
-            let mut branch = match repo.find_branch(
-                branch_name,
-                git2::BranchType::Local,
-            ) {
+            let mut branch = match repo.find_branch(branch_name, git2::BranchType::Local) {
                 Ok(branch) => branch,
                 Err(e) => {
                     return Err(io::Error::other(format!(
                         "Failed to find branch '{}': {}",
-                        branch_name, e.message(),
+                        branch_name,
+                        e.message(),
                     )));
                 }
             };
@@ -248,14 +319,13 @@ pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io
     let mut callbacks = RemoteCallbacks::new();
 
     callbacks.credentials(|url, username, allowed| {
-        Cred::credential_helper(&repo.config()?, url, username)
-            .or_else(|_| {
-                if allowed.contains(git2::CredentialType::SSH_KEY) {
-                    Cred::ssh_key_from_agent(username.unwrap_or("git"))
-                } else {
-                    Err(git2::Error::from_str("No suitable credentials"))
-                }
-            })
+        Cred::credential_helper(&repo.config()?, url, username).or_else(|_| {
+            if allowed.contains(git2::CredentialType::SSH_KEY) {
+                Cred::ssh_key_from_agent(username.unwrap_or("git"))
+            } else {
+                Err(git2::Error::from_str("No suitable credentials"))
+            }
+        })
     });
 
     let mut push_options = PushOptions::new();
@@ -271,8 +341,7 @@ pub fn init(name: Option<&str>, force: bool, remote: &str, lo: LogOptions) -> io
                 e.message(),
             )));
         }
-    }
-    else {
+    } else {
         if let Err(e) = remote.push(
             &["refs/heads/master:refs/heads/master"],
             Some(&mut push_options),
@@ -313,40 +382,29 @@ fn callbacks(repo: &Repository) -> RemoteCallbacks<'_> {
     let mut callbacks = RemoteCallbacks::new();
 
     callbacks.credentials(|url, username, allowed| {
-        Cred::credential_helper(&repo.config()?, url, username)
-            .or_else(|_| {
-                if allowed.contains(git2::CredentialType::SSH_KEY) {
-                    Cred::ssh_key_from_agent(username.unwrap_or("git"))
-                } else {
-                    Err(git2::Error::from_str("No suitable credentials"))
-                }
-            })
+        Cred::credential_helper(&repo.config()?, url, username).or_else(|_| {
+            if allowed.contains(git2::CredentialType::SSH_KEY) {
+                Cred::ssh_key_from_agent(username.unwrap_or("git"))
+            } else {
+                Err(git2::Error::from_str("No suitable credentials"))
+            }
+        })
     });
 
     callbacks
 }
 
-pub fn pull(
-    repo: &Repository,
-    force: bool,
-    lo: LogOptions,
-) -> Result<(), io::Error> {
+pub fn pull(repo: &Repository, force: bool, lo: LogOptions) -> Result<(), io::Error> {
     let mut fetch_options = FetchOptions::new();
     fetch_options.remote_callbacks(callbacks(repo));
 
     log!(v lo, "Fetching repository changes...");
     // git fetch origin master
     {
-        let mut remote = repo
-            .find_remote("origin")
-            .map_err(git_error)?;
+        let mut remote = repo.find_remote("origin").map_err(git_error)?;
 
         remote
-            .fetch(
-                &["master"],
-                Some(&mut fetch_options),
-                None,
-            )
+            .fetch(&["master"], Some(&mut fetch_options), None)
             .map_err(git_error)?;
     }
 
@@ -361,10 +419,7 @@ pub fn pull(
         .find_branch("master", git2::BranchType::Local)
         .map_err(git_error)?;
 
-    let local_commit = local_branch
-        .get()
-        .peel_to_commit()
-        .map_err(git_error)?;
+    let local_commit = local_branch.get().peel_to_commit().map_err(git_error)?;
 
     // Already up to date
     if local_commit.id() == remote_commit.id() {
@@ -378,22 +433,13 @@ pub fn pull(
         log!(lo, "Updating local repository...");
         local_branch
             .get_mut()
-            .set_target(
-                remote_commit.id(),
-                "Force pull",
-            )
+            .set_target(remote_commit.id(), "Force pull")
             .map_err(git_error)?;
 
-        repo.set_head("refs/heads/master")
-            .map_err(git_error)?;
+        repo.set_head("refs/heads/master").map_err(git_error)?;
 
-        repo.checkout_head(
-            Some(
-                CheckoutBuilder::new()
-                    .force(),
-            ),
-        )
-        .map_err(git_error)?;
+        repo.checkout_head(Some(CheckoutBuilder::new().force()))
+            .map_err(git_error)?;
 
         log!(lo, "Updated local repository");
         return Ok(());
@@ -401,42 +447,33 @@ pub fn pull(
 
     // Normal pull: only fast-forward
     if repo
-        .graph_descendant_of(
-            remote_commit.id(),
-            local_commit.id(),
-        )
+        .graph_descendant_of(remote_commit.id(), local_commit.id())
         .map_err(git_error)?
     {
         log!(lo, "Updating local repository...");
         local_branch
             .get_mut()
-            .set_target(
-                remote_commit.id(),
-                "Fast-forward",
-            )
+            .set_target(remote_commit.id(), "Fast-forward")
             .map_err(git_error)?;
 
-        repo.set_head("refs/heads/master")
-            .map_err(git_error)?;
+        repo.set_head("refs/heads/master").map_err(git_error)?;
 
-        repo.checkout_head(
-            Some(
-                CheckoutBuilder::new()
-                    .force(),
-            ),
-        )
-        .map_err(git_error)?;
+        repo.checkout_head(Some(CheckoutBuilder::new().force()))
+            .map_err(git_error)?;
 
         log!(lo, "Updated local repository");
         return Ok(());
     }
 
-    Err(io::Error::other(
-        "Local and remote branches have diverged",
-    ))
+    Err(io::Error::other("Local and remote branches have diverged"))
 }
 
-pub fn add_and_push(repo: &Repository, message: &str, force: bool, lo: LogOptions) -> Result<bool, io::Error> {
+pub fn add_and_push(
+    repo: &Repository,
+    message: &str,
+    force: bool,
+    lo: LogOptions,
+) -> Result<bool, io::Error> {
     log!(v lo, "Adding files...");
     let mut index = repo.index().map_err(git_error)?;
 
@@ -449,18 +486,16 @@ pub fn add_and_push(repo: &Repository, message: &str, force: bool, lo: LogOption
     log!(v lo, "Added files");
 
     // Check whether the index differs from HEAD.
-    let head_tree = repo
-        .head()
-        .ok()
-        .and_then(|head| head.peel_to_tree().ok());
+    let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
 
     let has_changes = match head_tree {
-        Some(tree) => repo
-            .diff_tree_to_index(Some(&tree), Some(&index), None)
-            .map_err(git_error)?
-            .deltas()
-            .len()
-            > 0,
+        Some(tree) => {
+            repo.diff_tree_to_index(Some(&tree), Some(&index), None)
+                .map_err(git_error)?
+                .deltas()
+                .len()
+                > 0
+        }
 
         None => index.len() > 0,
     };
@@ -494,15 +529,8 @@ pub fn add_and_push(repo: &Repository, message: &str, force: bool, lo: LogOption
         )
         .map_err(git_error)?;
     } else {
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &[],
-        )
-        .map_err(git_error)?;
+        repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+            .map_err(git_error)?;
     }
     log!(v lo, "Commitied changes");
 
@@ -513,19 +541,18 @@ pub fn add_and_push(repo: &Repository, message: &str, force: bool, lo: LogOption
     let mut callbacks = RemoteCallbacks::new();
 
     callbacks.credentials(|url, username, allowed| {
-        Cred::credential_helper(&repo.config()?, url, username)
-            .or_else(|_| {
-                if allowed.contains(git2::CredentialType::SSH_KEY) {
-                    Cred::ssh_key_from_agent(username.unwrap_or("git"))
-                } else {
-                    Err(git2::Error::from_str("No suitable credentials"))
-                }
-            })
+        Cred::credential_helper(&repo.config()?, url, username).or_else(|_| {
+            if allowed.contains(git2::CredentialType::SSH_KEY) {
+                Cred::ssh_key_from_agent(username.unwrap_or("git"))
+            } else {
+                Err(git2::Error::from_str("No suitable credentials"))
+            }
+        })
     });
 
     let mut push_options = PushOptions::new();
     push_options.remote_callbacks(callbacks);
-    
+
     if force {
         remote
             .push(
@@ -533,8 +560,7 @@ pub fn add_and_push(repo: &Repository, message: &str, force: bool, lo: LogOption
                 Some(&mut push_options),
             )
             .map_err(git_error)?;
-    }
-    else {
+    } else {
         remote
             .push(
                 &["refs/heads/master:refs/heads/master"],
