@@ -1,0 +1,13 @@
+product-name = "PLG"
+name = "plg"
+version = "1.0.0"
+identifier = "hr.from.leon-zlender.plg"
+description = "Tool for syncing playlists with Git with a CLI."
+out-dir = "../target/release"
+icons = ["../assets/plg.png", "../assets/plg.ico"]
+before-packaging-command = "cargo build --release --bin plg"
+category = "Music"
+
+[[binaries]]
+path = "plg"
+main = true

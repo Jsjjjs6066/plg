@@ -1,0 +1,16 @@
+product-name = "PLG Qt"
+name = "plg-qt"
+version = "1.0.0"
+identifier = "hr.from.leon-zlender.plg-qt"
+description = "Tool for syncing playlists with Git in Qt."
+out-dir = "../target/release"
+icons = ["../assets/plg.png", "../assets/plg.ico"]
+before-packaging-command = "cargo build --release --bin plg-qt --features qt"
+category = "Music"
+
+[[binaries]]
+path = "plg-qt"
+main = true
+
+[appimage]
+files = {}
