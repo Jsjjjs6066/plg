@@ -14,6 +14,9 @@ use std::{
     ffi::OsStr, fs, io, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
     let path = config_path();
 
@@ -104,14 +107,38 @@ fn create_shortcut(name: &str, output_dir: Option<PathBuf>, lo: LogOptions) -> i
 
     #[cfg(windows)]
     {
-        let path = output_dir.join(format!("{name}.bat"));
-        let quote = |value: &str| format!("\"{}\"", value.replace('"', "\"\""));
-        let contents = format!(
-            "@echo off\ncd /d {}\n{} play\n",
-            quote(&playlist_dir.to_string_lossy()),
-            quote(&executable.to_string_lossy()),
+        let path = output_dir.join(format!("{name}.lnk"));
+        println!("{:#?}", executable);
+        let quote_powershell = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             try {{ \
+                 $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut({}); \
+                 $shortcut.TargetPath = {}; \
+                 $shortcut.Arguments = 'play'; \
+                 $shortcut.WorkingDirectory = {}; \
+                 $shortcut.IconLocation = {}; \
+                 $shortcut.Save(); \
+             }} catch {{ \
+                 [Console]::Error.WriteLine($_.ToString()); \
+                 exit 1 \
+             }}",
+            quote_powershell(&path.to_string_lossy()),
+            quote_powershell(&executable.to_string_lossy()),
+            quote_powershell(&playlist_dir.to_string_lossy()),
+            quote_powershell(&format!("{},0", executable.to_string_lossy())),
         );
-        fs::write(&path, contents)?;
+        let output = Command::new("powershell.exe")
+            .creation_flags(0x08000000)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()?;
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            return Err(io::Error::other(format!(
+                "Unable to create Windows shortcut: {}",
+                error.trim()
+            )));
+        }
         log!(lo, "Created shortcut at {}", path.display());
     }
 

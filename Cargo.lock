@@ -914,6 +914,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "cxx",
  "directories",
  "embed-resource",
  "git2",

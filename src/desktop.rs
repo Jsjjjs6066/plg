@@ -2,7 +2,10 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     thread,
 };
 
@@ -134,6 +137,13 @@ fn error_box(error: impl ToString) {
         .exec();
 }
 
+fn set_window_icon(window: &MainWindow, icon_path: &str) {
+    cxx::let_cxx_string!(path = icon_path);
+    unsafe {
+        qtrs::ffi::QWidget_setWindowIcon(window.widget_ptr(), &path);
+    }
+}
+
 fn app_icon_path() -> Result<PathBuf, std::io::Error> {
     #[cfg(windows)]
     let icon_name = "plg.ico";
@@ -184,6 +194,37 @@ fn run_command(state: Arc<RwLock<State>>, command: crate::Cmds, lo: LogOptions, 
             restart(state);
         }
     });
+}
+
+fn run_shortcut_command(command: crate::Cmds, lo: LogOptions, timers: &UiTimers) {
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_for_worker = Arc::clone(&finished);
+    thread::spawn(move || {
+        if let Err(error) = crate::run(command, lo) {
+            log!(lo, "Error: {error}");
+        }
+        finished_for_worker.store(true, Ordering::Release);
+    });
+
+    let dialog = Rc::new(RefCell::new(Some(
+        ProgressDialog::new("Creating shortcut...", "", 0, 0).build(),
+    )));
+    if let Some(dialog) = dialog.borrow().as_ref() {
+        dialog.set_minimum_duration(0);
+        dialog.show();
+    }
+
+    let dialog_for_timer = Rc::clone(&dialog);
+    let timer = Timer::new(50)
+        .on_timeout(move || {
+            if finished.load(Ordering::Acquire) {
+                if let Some(dialog) = dialog_for_timer.borrow_mut().take() {
+                    dialog.close();
+                }
+            }
+        })
+        .build();
+    timers.borrow_mut().push(timer);
 }
 
 struct SharedTextBrowser(Rc<RefCell<TextBrowser>>);
@@ -1027,6 +1068,7 @@ fn shortcut_page(
 
     let state_for_action = Arc::clone(&state);
     let name_for_action = Rc::clone(&name_field);
+    let timers_for_action = Rc::clone(timers);
     let action = Rc::new(RefCell::new(
         PushButton::new("Create shortcut")
             .on_clicked(move || {
@@ -1036,10 +1078,10 @@ fn shortcut_page(
                     |state| &mut state.shortcut_name,
                 );
                 let output_dir = state_for_action.read().unwrap().output_dir.clone();
-                run_command(state_for_action.clone(), crate::Cmds::Shortcut {
+                run_shortcut_command(crate::Cmds::Shortcut {
                     name,
                     output_dir: (!output_dir.is_empty()).then_some(output_dir.into()),
-                }, lo, false);
+                }, lo, &timers_for_action);
             })
             .build(),
     ));
@@ -1319,19 +1361,26 @@ pub fn run(app: Arc<RwLock<Application>>, state: Arc<RwLock<State>>, c: &Config,
         append_output(&mut output_for_sink.lock().unwrap(), chunk);
     })));
 
-    match app_icon_path() {
-        Ok(icon_path) => app
-            .read()
-            .unwrap()
-            .set_icon(&icon_path.to_string_lossy()),
+    let icon_path = match app_icon_path() {
+        Ok(icon_path) => {
+            app.read()
+                .unwrap()
+                .set_icon(&icon_path.to_string_lossy());
+            Some(icon_path)
+        }
         Err(error) => {
-            error_box(error)
+            error_box(error);
+            None
         },
-    }
+    };
 
-    let window = Rc::new(RefCell::new(
-        MainWindow::new().window_title("Playlist with Git").build(),
-    ));
+    let main_window = MainWindow::new()
+        .window_title("Playlist with Git")
+        .build();
+    if let Some(icon_path) = icon_path {
+        set_window_icon(&main_window, &icon_path.to_string_lossy());
+    }
+    let window = Rc::new(RefCell::new(main_window));
     let create_output_view = || {
         let output_view = Rc::new(RefCell::new(TextBrowser::new().build()));
         output_view.borrow().set_font(&Font::new().point_size(12).build());
