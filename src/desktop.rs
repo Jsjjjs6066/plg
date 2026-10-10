@@ -9,9 +9,6 @@ use std::{
     thread,
 };
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use crate::{Config, LocalConfig, load_config, load_local_config};
 use chrono::TimeDelta;
 use plg::{LogOptions, cwd, log, repo, set_log_sink};
