@@ -34,6 +34,21 @@ fn save_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn local_config_path() -> PathBuf {
+    cwd().join(".plg.toml")
+}
+
+pub(crate) fn load_local_config() -> Result<LocalConfig, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(local_config_path())?;
+    Ok(toml::from_str(&text)?)
+}
+
+pub(crate) fn save_local_config(config: &LocalConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let text = toml::to_string_pretty(config)?;
+    fs::write(local_config_path(), text)?;
+    Ok(())
+}
+
 fn config_path() -> std::path::PathBuf {
     ProjectDirs::from("", "", "plg")
         .unwrap()
@@ -112,20 +127,30 @@ fn create_shortcut(name: &str, output_dir: Option<PathBuf>, lo: LogOptions) -> i
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub default_player: Option<String>,
-    pub last_updated: Option<NaiveDateTime>,
     pub update_cooldown_m: Option<u16>,
     pub disable_update_on_play: Option<bool>,
+    pub last_output_dir: Option<String>,
+    pub last_directory: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             default_player: None,
-            last_updated: None,
             update_cooldown_m: Some(3 * 60),
             disable_update_on_play: None,
+            last_output_dir: None,
+            last_directory: None,
         }
     }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct LocalConfig {
+    pub default_player: Option<String>,
+    pub last_updated: Option<NaiveDateTime>,
+    pub update_cooldown_m: Option<u16>,
+    pub disable_update_on_play: Option<bool>,
 }
 
 #[derive(Parser)]
@@ -253,8 +278,40 @@ enum Cmds {
         disable_update_on_play: Option<bool>,
     },
     #[command(long_about)]
+    /// Configure settings for the current playlist.
+    CfgLocal {
+        #[arg(long)]
+        /// The default music player.
+        default_player: Option<String>,
+        #[arg(long)]
+        /// Sets the update cooldown in minutes. Can be combined with hours: `plg cfg
+        /// --update-cooldown-h 2 --update-cooldown-m 30`.
+        update_cooldown_m: Option<u8>,
+        #[arg(long)]
+        /// Sets the update cooldown in hours. Can be combined with minutes: `plg cfg
+        /// --update-cooldown-h 2 --update-cooldown-m 30`.
+        update_cooldown_h: Option<u8>,
+        #[arg(long)]
+        /// Disables automatic updating when playing.
+        disable_update_on_play: Option<bool>,
+    },
+    #[command(long_about)]
     /// Resets the specified global settings to default values.
     Reset {
+        #[arg(long)]
+        /// The default music player.
+        default_player: bool,
+        #[arg(long)]
+        /// Update cooldown: by default does not update the local repository until the cooldown
+        /// passes if not planning to write changes to the repository.
+        update_cooldown: bool,
+        #[arg(long)]
+        /// Disables automatic updating when playing.
+        disable_update_on_play: bool,
+    },
+    #[command(long_about)]
+    /// Resets the specified settings for the current playlist.
+    ResetLocal {
         #[arg(long)]
         /// The default music player.
         default_player: bool,
@@ -291,19 +348,24 @@ enum Cmds {
 }
 
 fn update(
-    cfg: &mut Config,
+    global: &Config,
+    local: &mut LocalConfig,
     repo: &Repository,
     ignore_cfg: bool,
     force: bool,
     lo: LogOptions,
 ) -> io::Result<()> {
     let now = chrono::Utc::now().naive_utc();
-    if ((now - TimeDelta::minutes(cfg.update_cooldown_m.unwrap_or_default() as i64))
-        >= cfg.last_updated.unwrap_or_default())
+    let cooldown = local
+        .update_cooldown_m
+        .or(global.update_cooldown_m)
+        .unwrap_or_default();
+    if ((now - TimeDelta::minutes(cooldown as i64))
+        >= local.last_updated.unwrap_or_default())
         || ignore_cfg
     {
         pull(repo, force, lo)?;
-        cfg.last_updated = Some(chrono::Utc::now().naive_utc());
+        local.last_updated = Some(chrono::Utc::now().naive_utc());
     }
     else {
         log!(lo, "Skipping update. Force an update by using `plg update`.");
@@ -337,9 +399,10 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
         } => {
             let repo = repo()?;
             if !no_update_local {
-                let mut cfg = load_config().unwrap_or_default();
-                update(&mut cfg, &repo, true, force_update_local, lo)?;
-                if let Err(e) = save_config(&cfg) {
+                let cfg = load_config().unwrap_or_default();
+                let mut local = load_local_config().unwrap_or_default();
+                update(&cfg, &mut local, &repo, true, force_update_local, lo)?;
+                if let Err(e) = save_local_config(&local) {
                     return Err(io::Error::other(format!("Unable to load config: {e}")));
                 }
             }
@@ -354,9 +417,10 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
             download(url, lo)?;
         }
         Cmds::Update { force } => {
-            let mut cfg = load_config().unwrap_or_default();
-            update(&mut cfg, &repo()?, true, force, lo)?;
-            if let Err(e) = save_config(&cfg) {
+            let cfg = load_config().unwrap_or_default();
+            let mut local = load_local_config().unwrap_or_default();
+            update(&cfg, &mut local, &repo()?, true, force, lo)?;
+            if let Err(e) = save_local_config(&local) {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
         }
@@ -368,9 +432,10 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
         } => {
             let repo = repo()?;
             if !no_update_local {
-                let mut cfg = load_config().unwrap_or_default();
-                update(&mut cfg, &repo, true, force_update_local, lo)?;
-                if let Err(e) = save_config(&cfg) {
+                let cfg = load_config().unwrap_or_default();
+                let mut local = load_local_config().unwrap_or_default();
+                update(&cfg, &mut local, &repo, true, force_update_local, lo)?;
+                if let Err(e) = save_local_config(&local) {
                     return Err(io::Error::other(format!("Unable to load config: {e}")));
                 }
             }
@@ -385,10 +450,11 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
         } => {
             if !no_update {
                 if let Ok(ref r) = repo() {
-                    let mut cfg = load_config().unwrap_or_default();
-                    if !cfg.disable_update_on_play.unwrap_or_default() {
-                        update(&mut cfg, r, false, force_update, lo)?;
-                        if let Err(e) = save_config(&cfg) {
+                    let cfg = load_config().unwrap_or_default();
+                    let mut local = load_local_config().unwrap_or_default();
+                    if !local.disable_update_on_play.or(cfg.disable_update_on_play).unwrap_or_default() {
+                        update(&cfg, &mut local, r, false, force_update, lo)?;
+                        if let Err(e) = save_local_config(&local) {
                             return Err(io::Error::other(format!("Unable to load config: {e}")));
                         }
                     } else {
@@ -410,7 +476,8 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
             } 
             else {
                 let cfg = load_config().unwrap_or_default();
-                if let Some(p) = cfg.default_player {
+                let local = load_local_config().unwrap_or_default();
+                if let Some(p) = local.default_player.or(cfg.default_player) {
                     Command::new(p)
                         .arg(".")
                         .args(args)
@@ -453,6 +520,30 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
         }
+        Cmds::CfgLocal {
+            default_player,
+            update_cooldown_m,
+            update_cooldown_h,
+            disable_update_on_play,
+        } => {
+            let mut cfg = load_local_config().unwrap_or_default();
+
+            if let Some(player) = default_player {
+                cfg.default_player = Some(player);
+            }
+            if update_cooldown_m.is_some() || update_cooldown_h.is_some() {
+                let m = update_cooldown_m.unwrap_or_default();
+                let h = update_cooldown_h.unwrap_or_default();
+                cfg.update_cooldown_m = Some(60 * h as u16 + m as u16);
+            }
+            if let Some(value) = disable_update_on_play {
+                cfg.disable_update_on_play = Some(value);
+            }
+
+            if let Err(e) = save_local_config(&cfg) {
+                return Err(io::Error::other(format!("Unable to save local config: {e}")));
+            }
+        }
         Cmds::Reset {
             default_player,
             update_cooldown,
@@ -476,6 +567,26 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
                 return Err(io::Error::other(format!("Unable to load config: {e}")));
             }
         }
+        Cmds::ResetLocal {
+            default_player,
+            update_cooldown,
+            disable_update_on_play,
+        } => {
+            let mut cfg = load_local_config().unwrap_or_default();
+            if default_player {
+                cfg.default_player = None;
+            }
+            if update_cooldown {
+                cfg.update_cooldown_m = None;
+                cfg.last_updated = None;
+            }
+            if disable_update_on_play {
+                cfg.disable_update_on_play = None;
+            }
+            if let Err(e) = save_local_config(&cfg) {
+                return Err(io::Error::other(format!("Unable to save local config: {e}")));
+            }
+        }
         Cmds::ShowCfg => {
             println!("{:#?}", load_config().unwrap_or_default());
         }
@@ -488,7 +599,13 @@ fn run(args: Cmds, lo: LogOptions) -> io::Result<LogOptions> {
             generate(shell, &mut Cli::command(), "plg", &mut io::stdout());
         }
         Cmds::Shortcut { name, output_dir } => {
-            create_shortcut(&name, output_dir, lo)?;
+            let output_dir = output_dir.unwrap_or_else(cwd);
+            create_shortcut(&name, Some(output_dir.clone()), lo)?;
+            let mut cfg = load_config().unwrap_or_default();
+            cfg.last_output_dir = Some(output_dir.to_string_lossy().into_owned());
+            if let Err(e) = save_config(&cfg) {
+                return Err(io::Error::other(format!("Unable to save config: {e}")));
+            }
         }
     }
     Ok(lo)
@@ -516,6 +633,11 @@ fn main() -> ExitCode {
         }
         else {
             let cfg = load_config().unwrap_or_default();
+            if let Some(directory) = cfg.last_directory.as_deref() {
+                if Path::new(directory).is_dir() {
+                    let _ = std::env::set_current_dir(directory);
+                }
+            }
             desktop::run(&cfg, lo);
             return ExitCode::SUCCESS;
         }

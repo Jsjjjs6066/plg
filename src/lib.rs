@@ -50,7 +50,7 @@ pub fn emit_process_output(output: &str) {
 }
 
 #[repr(u8)]
-#[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
+#[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy, Debug)]
 pub enum LogOptions {
     Quiet = 0,
     Normal = 1,

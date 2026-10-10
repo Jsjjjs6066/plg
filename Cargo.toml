@@ -13,18 +13,18 @@ build = "build.rs"
 autobins = false
 
 [dependencies]
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] , optional = true}
 directories = "6.0.0"
 git2 = { version = "0.21.0", features = ["https", "ssh", "vendored-openssl"] }
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.4"
+toml = "1.1.6"
 chrono = { version = "0.4", features = ["serde"] }
-serde_with = { version = "3.0", features = ["chrono"] } 
-clap_complete = "4.6.9"
-qtrs = { version = "0.5.8", optional = true }
+serde_with = { version = "3.23.0", features = ["chrono"] } 
+clap_complete = { version = "4.6.11", optional = true }
+qtrs = { version = "0.5.9", optional = true }
 
 [features]
-cli = []
+cli = ["dep:clap", "dep:clap_complete"]
 qt = ["cli", "dep:qtrs"]
 
 default = ["cli"]
@@ -54,3 +54,6 @@ required-features = ["cli"]
 name = "plg-qt"
 path = "src/main.rs"
 required-features = ["qt"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
