@@ -32,15 +32,6 @@ default = ["cli"]
 [build-dependencies]
 embed-resource = "2.5"
 
-[package.metadata.packager]
-name = "PLG"
-identifier = "hr.from.leon-zlender.plg"
-version = "1.0.0"
-authors = ["Leon Žlender"]
-description = "Tool for syncing playlists with Git."
-icons = ["assets/plg.ico", "assets/plg.icns", "assets/plg256x256.png"]
-before-packaging-command = "cargo build --release"
-
 [profile.release]
 opt-level = "s"
 lto = true  

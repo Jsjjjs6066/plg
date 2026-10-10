@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "qt", windows_subsystem = "windows")]
+
 #[cfg(feature = "qt")]
 pub mod desktop;
 
@@ -623,6 +625,11 @@ fn main() -> ExitCode {
     };
 
     #[cfg(feature = "qt")] {
+        use std::sync::Arc;
+        use std::sync::RwLock;
+        use crate::desktop::State;
+        use qtrs::Application;
+
         if let Some(a) = args.command {
             let err = run(a, lo);
             if let Err(e) = err {
@@ -632,14 +639,20 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         else {
+            let app = Arc::new(RwLock::new(Application::new()));
+            let state = Arc::new(RwLock::new(State::default()));
+
             let cfg = load_config().unwrap_or_default();
             if let Some(directory) = cfg.last_directory.as_deref() {
                 if Path::new(directory).is_dir() {
                     let _ = std::env::set_current_dir(directory);
                 }
             }
-            desktop::run(&cfg, lo);
-            return ExitCode::SUCCESS;
+            return ExitCode::from(
+                desktop::run(app, state, &cfg, lo)
+                    .try_into()
+                    .unwrap_or(255),
+            );
         }
     }
 

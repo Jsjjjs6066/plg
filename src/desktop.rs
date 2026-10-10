@@ -1,12 +1,11 @@
 use std::{
     cell::RefCell,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
     thread,
 };
 
-#[cfg(not(unix))]
-use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -35,7 +34,10 @@ pub struct State {
     reinit: bool,
     shortcut_name: String,
     output_dir: String,
+    restart_requested: bool,
 }
+
+type UiTimers = Rc<RefCell<Vec<Timer>>>;
 
 impl Default for State {
     fn default() -> Self {
@@ -58,43 +60,20 @@ impl Default for State {
             reinit: false,
             shortcut_name: String::new(),
             output_dir: String::new(),
+            restart_requested: false,
         }
     }
 }
 
-fn restart(code: i32) -> ! {
-    let executable = match std::env::current_exe() {
-        Ok(executable) => executable,
-        Err(error) => {
-            error_box(format!("Unable to restart: {error}"));
-            std::process::exit(code);
-        }
-    };
-    let arguments = std::env::args_os().skip(1);
-
-    #[cfg(unix)]
-    {
-        let error = std::process::Command::new(executable)
-            .args(arguments)
-            .exec();
-        error_box(format!("Unable to restart: {error}"));
-        std::process::exit(code);
-    }
-
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = Command::new(executable).args(arguments).spawn() {
-            error_box(format!("Unable to restart: {error}"));
-        }
-        std::process::exit(code);
-    }
+fn restart(state: Arc<RwLock<State>>) {
+    state.write().unwrap().restart_requested = true;
 }
 
-fn update_options(state: &Arc<RwLock<State>>, font: &Font) -> Rc<RefCell<ComboBox>> {
+fn update_options(state: Arc<RwLock<State>>, font: &Font, timers: &UiTimers) -> Rc<RefCell<ComboBox>> {
     let options = Rc::new(RefCell::new(ComboBox::new()
         .items(&["Default update", "No update", "Force update"])
         .build()));
-    let state_for_signal = Arc::clone(state);
+    let state_for_signal = Arc::clone(&state);
     options.borrow_mut().connect_current_index_changed(move |index| {
         state_for_signal.write().unwrap().update_option = index as u8;
     });
@@ -109,12 +88,12 @@ fn update_options(state: &Arc<RwLock<State>>, font: &Font) -> Rc<RefCell<ComboBo
             }
         })
         .build();
-    std::mem::forget(timer);
+    timers.borrow_mut().push(timer);
     options
 }
 
-fn force_update_checkbox(state: &Arc<RwLock<State>>, font: &Font) -> Rc<RefCell<CheckBox>> {
-    let state_for_checkbox = Arc::clone(state);
+fn force_update_checkbox(state: Arc<RwLock<State>>, font: &Font, timers: &UiTimers) -> Rc<RefCell<CheckBox>> {
+    let state_for_checkbox = Arc::clone(&state);
     let checkbox = Rc::new(RefCell::new(CheckBox::new("Force update")
         .on_toggled(move |checked| {
             state_for_checkbox.write().unwrap().update_option = if checked { 2 } else { 0 };
@@ -123,7 +102,7 @@ fn force_update_checkbox(state: &Arc<RwLock<State>>, font: &Font) -> Rc<RefCell<
     checkbox.borrow().set_font(font);
     checkbox.borrow_mut().set_checked(state.read().unwrap().update_option == 2);
     let checkbox_for_timer = Rc::downgrade(&checkbox);
-    let state_for_timer = Arc::clone(state);
+    let state_for_timer = Arc::clone(&state);
     let timer = Timer::new(50)
         .on_timeout(move || {
             if let Some(checkbox) = checkbox_for_timer.upgrade() {
@@ -134,11 +113,11 @@ fn force_update_checkbox(state: &Arc<RwLock<State>>, font: &Font) -> Rc<RefCell<
             }
         })
         .build();
-    std::mem::forget(timer);
+    timers.borrow_mut().push(timer);
     checkbox
 }
 
-fn update_values(state: &Arc<RwLock<State>>) -> (bool, bool) {
+fn update_values(state: Arc<RwLock<State>>) -> (bool, bool) {
     match state.read().unwrap().update_option {
         1 => (true, false),
         2 => (false, true),
@@ -155,6 +134,34 @@ fn error_box(error: impl ToString) {
         .exec();
 }
 
+fn app_icon_path() -> Result<PathBuf, std::io::Error> {
+    #[cfg(windows)]
+    let icon_name = "plg.ico";
+    #[cfg(not(windows))]
+    let icon_name = "plg.png";
+
+    let executable = std::env::current_exe()?;
+    let executable_dir = executable.parent().ok_or_else(|| {
+        std::io::Error::other("Unable to determine the application directory.")
+    })?;
+
+    for directory in executable_dir.ancestors() {
+        for candidate in [
+            directory.join("assets").join(icon_name),
+            directory.join(icon_name),
+        ] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("Unable to find {icon_name} alongside the application executable."),
+    ))
+}
+
 fn append_output(output: &mut String, chunk: &str) {
     for character in chunk.chars() {
         if character == '\r' {
@@ -169,12 +176,12 @@ fn append_output(output: &mut String, chunk: &str) {
     }
 }
 
-fn run_command(command: crate::Cmds, lo: LogOptions, restart_after: bool) {
+fn run_command(state: Arc<RwLock<State>>, command: crate::Cmds, lo: LogOptions, restart_after: bool) {
     thread::spawn(move || {
         if let Err(error) = crate::run(command, lo) {
             log!(lo, "Error: {error}");
         } else if restart_after {
-            restart(0);
+            restart(state);
         }
     });
 }
@@ -253,7 +260,7 @@ impl AsWidget for SharedCheckBox {
 
 fn add_field(
     layout: &mut VBoxLayout,
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     field: fn(&mut State) -> &mut String,
     label: &str,
     font: &Font,
@@ -265,7 +272,7 @@ fn add_field(
     let initial_value = field(&mut state.write().unwrap()).clone();
     let edit = Rc::new(RefCell::new(LineEdit::new(initial_value).build()));
     edit.borrow().set_font(font);
-    let state_for_edit = Arc::clone(state);
+    let state_for_edit = Arc::clone(&state);
     let edit_for_signal = Rc::downgrade(&edit);
     edit.borrow_mut().connect_return_pressed(move || {
         if let Some(edit) = edit_for_signal.upgrade() {
@@ -280,7 +287,7 @@ fn add_field(
 
 fn add_field_value(
     layout: &mut VBoxLayout,
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     field: fn(&mut State) -> &mut String,
     label: &str,
     font: &Font,
@@ -293,7 +300,7 @@ fn add_field_value(
     let edit = Rc::new(RefCell::new(LineEdit::new("").build()));
     edit.borrow().set_font(font);
     edit.borrow_mut().set_text(value);
-    let state_for_edit = Arc::clone(state);
+    let state_for_edit = Arc::clone(&state);
     let edit_for_signal = Rc::downgrade(&edit);
     edit.borrow_mut().connect_return_pressed(move || {
         if let Some(edit) = edit_for_signal.upgrade() {
@@ -330,7 +337,6 @@ fn add_time_field_value(
     
     let mut wid = Widget::new().build();
     wid.set_layout(&vb);
-    wid.show();
     std::mem::forget(vb);
     
     layout.add_widget(Box::new(wid));
@@ -339,7 +345,7 @@ fn add_time_field_value(
 
 fn sync_field(
     edit: &Rc<RefCell<LineEdit>>,
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     field: fn(&mut State) -> &mut String,
 ) -> String {
     edit.borrow_mut().refresh_text();
@@ -350,7 +356,7 @@ fn sync_field(
 
 fn sync_field_number(
     edit: &Rc<RefCell<SpinBox>>,
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     field: fn(&mut State) -> &mut i32,
 ) -> i32 {
     let value = edit.borrow().value().to_owned();
@@ -366,23 +372,24 @@ fn page() -> (Widget, VBoxLayout) {
 
 fn add_update_controls(
     layout: &mut VBoxLayout,
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     font: &Font,
     force_checkbox: bool,
+    timers: &UiTimers,
 ) {
     let label = Label::new("Update options").build();
     label.set_font(font);
     layout.add_widget(Box::new(label));
     if force_checkbox {
-        layout.add_widget(Box::new(SharedCheckBox(force_update_checkbox(state, font))));
+        layout.add_widget(Box::new(SharedCheckBox(force_update_checkbox(state.clone(), font, timers))));
     } else {
-        layout.add_widget(Box::new(SharedComboBox(update_options(state, font))));
+        layout.add_widget(Box::new(SharedComboBox(update_options(state.clone(), font, timers))));
     }
 }
 
-pub fn run_ui(c: &Config, local: &LocalConfig, state: &Arc<RwLock<State>>, font: &Font, lo: LogOptions, selector: Rc<RefCell<ComboBox>>) -> Box<dyn AsWidget> {
+pub fn run_ui(c: &Config, local: &LocalConfig, state: Arc<RwLock<State>>, font: &Font, lo: LogOptions, selector: Rc<RefCell<ComboBox>>, timers: &UiTimers) -> Box<dyn AsWidget> {
     let (mut widget, mut layout) = page();
-    add_update_controls(&mut layout, state, font, false);
+    add_update_controls(&mut layout, state.clone(), font, false, timers);
 
     let mut run_in_w = Widget::new().build();
     let mut run_in_l = GridLayout::new();
@@ -406,10 +413,11 @@ pub fn run_ui(c: &Config, local: &LocalConfig, state: &Arc<RwLock<State>>, font:
             layout.add_widget(Box::new(notice));
         }
 
+    let state_for_default_player = Arc::clone(&state);
     let default_player = if let Some(player) = local.default_player.clone().or(c.default_player.clone()) {
         PushButton::new(format!("Play in {player}"))
             .on_clicked(move || {
-                run_command(crate::Cmds::Play {
+                run_command(state_for_default_player.clone(), crate::Cmds::Play {
                     no_update: false,
                     force_update: false,
                     player: None,
@@ -430,10 +438,10 @@ pub fn run_ui(c: &Config, local: &LocalConfig, state: &Arc<RwLock<State>>, font:
 
     layout.add_widget(Box::new(default_player));
 
+    let state_for_edit = state.clone();
     let player_field = {
         let edit = Rc::new(RefCell::new(LineEdit::new("").build()));
         edit.borrow().set_font(font);
-        let state_for_edit = Arc::clone(state);
         let edit_for_signal = Rc::downgrade(&edit);
         edit.borrow_mut().connect_return_pressed(move || {
             if let Some(edit) = edit_for_signal.upgrade() {
@@ -451,21 +459,21 @@ pub fn run_ui(c: &Config, local: &LocalConfig, state: &Arc<RwLock<State>>, font:
 
     let args_field = add_field(
         &mut layout,
-        state,
+        state.clone(),
         |state| &mut state.args,
         "Player arguments (optional)",
         font,
     );
     {
-        let state_for_play = Arc::clone(state);
+        let state_for_play = Arc::clone(&state);
         let player_for_play = Rc::clone(&player_field);
         let args_for_play = Rc::clone(&args_field);
         let play_in = PushButton::new("Play in...")
             .on_clicked(move || {
-                let (no_update, force_update) = update_values(&state_for_play);
-                let player = sync_field(&player_for_play, &state_for_play, |state| &mut state.player);
-                let args = sync_field(&args_for_play, &state_for_play, |state| &mut state.args);
-                run_command(crate::Cmds::Play {
+                let (no_update, force_update) = update_values(state_for_play.clone());
+                let player = sync_field(&player_for_play, state_for_play.clone(), |state| &mut state.player);
+                let args = sync_field(&args_for_play, state_for_play.clone(), |state| &mut state.args);
+                run_command(state_for_play.clone(), crate::Cmds::Play {
                     no_update,
                     force_update,
                     player: (!player.is_empty()).then_some(player),
@@ -486,12 +494,13 @@ pub fn run_ui(c: &Config, local: &LocalConfig, state: &Arc<RwLock<State>>, font:
 }
 
 fn other(
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     title: &str,
     command: crate::Cmds,
     font: &Font,
     lo: LogOptions,
     local: bool,
+    timers: &UiTimers,
 ) -> Box<dyn AsWidget> {
     let config = load_config().unwrap_or_default();
     let local_config = load_local_config().unwrap_or_default();
@@ -505,9 +514,10 @@ fn other(
     ) {
         add_update_controls(
             &mut layout,
-            state,
+            state.clone(),
             font,
             matches!(&command, crate::Cmds::Update { .. }),
+            timers,
         );
     }
     let url_field = if matches!(
@@ -516,7 +526,7 @@ fn other(
     ) {
         Some(add_field(
             &mut layout,
-            state,
+            state.clone(),
             |state| &mut state.url,
             "URL (required)",
             font,
@@ -527,7 +537,7 @@ fn other(
     let remote_field = if matches!(&command, crate::Cmds::Init { .. }) {
         Some(add_field(
             &mut layout,
-            state,
+            state.clone(),
             |state| &mut state.remote,
             "Remote URL (required)",
             font,
@@ -538,7 +548,7 @@ fn other(
     let name_field = if matches!(&command, crate::Cmds::Init { .. }) {
         Some(add_field(
             &mut layout,
-            state,
+            state.clone(),
             |state| &mut state.name,
             "Playlist name (optional)",
             font,
@@ -549,7 +559,7 @@ fn other(
     let message_field = if matches!(&command, crate::Cmds::Add { .. } | crate::Cmds::Push { .. }) {
         Some(add_field(
             &mut layout,
-            state,
+            state.clone(),
             |state| &mut state.message,
             "Commit message (optional)",
             font,
@@ -560,7 +570,7 @@ fn other(
     let default_player_field = if matches!(&command, crate::Cmds::Cfg { .. } | crate::Cmds::CfgLocal { .. }) {
         Some(add_field_value(
             &mut layout,
-            state,
+            state.clone(),
             |state| &mut state.default_player,
             "Default player",
             font,
@@ -587,7 +597,7 @@ fn other(
         &command,
         crate::Cmds::Add { .. } | crate::Cmds::Push { .. } | crate::Cmds::Init { .. }
     ) {
-        let state_for_force = Arc::clone(state);
+        let state_for_force = Arc::clone(&state);
         let checkbox = CheckBox::new("Force push")
             .on_toggled(move |checked| state_for_force.write().unwrap().force_push = checked)
             .build();
@@ -595,7 +605,7 @@ fn other(
         layout.add_widget(Box::new(checkbox));
     }
     if matches!(&command, crate::Cmds::Init { .. }) {
-        let state_for_reinit = Arc::clone(state);
+        let state_for_reinit = Arc::clone(&state);
         let checkbox = CheckBox::new("Reinitialize repository")
             .on_toggled(move |checked| state_for_reinit.write().unwrap().reinit = checked)
             .build();
@@ -603,7 +613,7 @@ fn other(
         layout.add_widget(Box::new(checkbox));
     }
     if matches!(&command, crate::Cmds::Reset { .. } | crate::Cmds::ResetLocal { .. }) {
-        let state_for_reset = Arc::clone(state);
+        let state_for_reset = Arc::clone(&state);
         let checkbox = CheckBox::new("Reset default player")
             .on_toggled(move |checked| {
                 state_for_reset.write().unwrap().reset_default_player = checked
@@ -611,7 +621,7 @@ fn other(
             .build();
         checkbox.set_font(font);
         layout.add_widget(Box::new(checkbox));
-        let state_for_reset = Arc::clone(state);
+        let state_for_reset = Arc::clone(&state);
         let checkbox = CheckBox::new("Reset update cooldown")
             .on_toggled(move |checked| {
                 state_for_reset.write().unwrap().reset_update_cooldown = checked
@@ -619,7 +629,7 @@ fn other(
             .build();
         checkbox.set_font(font);
         layout.add_widget(Box::new(checkbox));
-        let state_for_reset = Arc::clone(state);
+        let state_for_reset = Arc::clone(&state);
         let checkbox = CheckBox::new("Reset update on play")
             .on_toggled(move |checked| {
                 state_for_reset
@@ -632,7 +642,7 @@ fn other(
         layout.add_widget(Box::new(checkbox));
     }
     if matches!(&command, crate::Cmds::Cfg { .. } | crate::Cmds::CfgLocal { .. }) {
-        let state_for_disable = Arc::clone(state);
+        let state_for_disable = Arc::clone(&state);
         let checkbox = CheckBox::new("Disable update on play")
             .on_toggled(move |checked| {
                 state_for_disable.write().unwrap().disable_update_on_play = checked
@@ -650,7 +660,7 @@ fn other(
         );
         layout.add_widget(Box::new(checkbox));
     }
-    let state_for_action = Arc::clone(state);
+    let state_for_action = Arc::clone(&state);
     let url_for_action = url_field.clone();
     let remote_for_action = remote_field.clone();
     let name_for_action = name_field.clone();
@@ -661,17 +671,17 @@ fn other(
     let action = Rc::new(RefCell::new(
         PushButton::new(format!("{}", title))
             .on_clicked(move || {
-                let (no_update, force_update) = update_values(&state_for_action);
+                let (no_update, force_update) = update_values(state_for_action.clone());
                 let command = match command {
                     crate::Cmds::Add { .. } => {
                         let url = sync_field(
                             url_for_action.as_ref().unwrap(),
-                            &state_for_action,
+                            state_for_action.clone(),
                             |state| &mut state.url,
                         );
                         let message = sync_field(
                             message_for_action.as_ref().unwrap(),
-                            &state_for_action,
+                            state_for_action.clone(),
                             |state| &mut state.message,
                         );
                         crate::Cmds::Add {
@@ -685,7 +695,7 @@ fn other(
                     crate::Cmds::Download { .. } => crate::Cmds::Download {
                         url: sync_field(
                             url_for_action.as_ref().unwrap(),
-                            &state_for_action,
+                            state_for_action.clone(),
                             |state| &mut state.url,
                         ),
                     },
@@ -699,7 +709,7 @@ fn other(
                         msg: {
                             let message = sync_field(
                                 message_for_action.as_ref().unwrap(),
-                                &state_for_action,
+                                state_for_action.clone(),
                                 |state| &mut state.message,
                             );
                             (!message.is_empty()).then_some(message)
@@ -709,7 +719,7 @@ fn other(
                         name: {
                             let name = sync_field(
                                 name_for_action.as_ref().unwrap(),
-                                &state_for_action,
+                                state_for_action.clone(),
                                 |state| &mut state.name,
                             );
                             (!name.is_empty()).then_some(name)
@@ -718,7 +728,7 @@ fn other(
                         reinit: state_for_action.read().unwrap().reinit,
                         remote: sync_field(
                             remote_for_action.as_ref().unwrap(),
-                            &state_for_action,
+                            state_for_action.clone(),
                             |state| &mut state.remote,
                         ),
                     },
@@ -727,19 +737,19 @@ fn other(
                             default_player: {
                             let player = sync_field(
                                 default_player_for_action.as_ref().unwrap(),
-                                &state_for_action,
+                                state_for_action.clone(),
                                 |state| &mut state.default_player,
                             );
                             (!player.is_empty()).then_some(player)
                         },
                         update_cooldown_m: Some(sync_field_number(
                             minutes_for_action.as_ref().unwrap(),
-                            &state_for_action,
+                            state_for_action.clone(),
                             |state| &mut state.update_cooldown_m,
                         ) as u8),
                         update_cooldown_h: Some(sync_field_number(
                             hours_for_action.as_ref().unwrap(),
-                            &state_for_action,
+                            state_for_action.clone(),
                             |state| &mut state.update_cooldown_h,
                         ) as u8),
                             disable_update_on_play: Some(
@@ -769,7 +779,7 @@ fn other(
                     _ => return,
                 };
                 let b = matches!(command, crate::Cmds::Cfg { .. } | crate::Cmds::CfgLocal { .. } | crate::Cmds::Reset { .. } | crate::Cmds::ResetLocal { .. });
-                run_command(command, lo, b);
+                run_command(state_for_action.clone(), command, lo, b);
             })
             .build(),
     ));
@@ -806,7 +816,7 @@ fn other(
                 }
             })
             .build();
-        std::mem::forget(timer);
+        timers.borrow_mut().push(timer);
     }
     layout.add_widget(Box::new(SharedButton(action)));
     layout.add_spacer(Spacer::vertical_expanding());
@@ -815,7 +825,7 @@ fn other(
     Box::new(widget)
 }
 
-pub fn other_action(config: &Config, _state: &Arc<RwLock<State>>, font: &Font, lo: LogOptions) -> Box<dyn AsWidget> {
+pub fn other_action(config: &Config, state: Arc<RwLock<State>>, font: &Font, lo: LogOptions) -> Box<dyn AsWidget> {
     let (mut widget, mut layout) = page();
     let local = load_local_config().unwrap_or_default();
 
@@ -871,10 +881,11 @@ pub fn other_action(config: &Config, _state: &Arc<RwLock<State>>, font: &Font, l
     du_label.set_font(font);
     slayout.add_widget(Box::new(du_label));
 
+    let state_for_reset_global = Arc::clone(&state);
     let reset_global = Rc::new(RefCell::new(
         PushButton::new("Reset all global configuration")
             .on_clicked(move || {
-                run_command(crate::Cmds::Reset {
+                run_command(state_for_reset_global.clone(), crate::Cmds::Reset {
                     default_player: true,
                     update_cooldown: true,
                     disable_update_on_play: true,
@@ -919,10 +930,11 @@ pub fn other_action(config: &Config, _state: &Arc<RwLock<State>>, font: &Font, l
     }).build();
     local_play.set_font(font);
     slayout.add_widget(Box::new(local_play));
+    let state_for_reset_local = Arc::clone(&state);
     let reset_local = Rc::new(RefCell::new(
         PushButton::new("Reset all local configuration")
             .on_clicked(move || {
-                run_command(crate::Cmds::ResetLocal {
+                run_command(state_for_reset_local.clone(), crate::Cmds::ResetLocal {
                     default_player: true,
                     update_cooldown: true,
                     disable_update_on_play: true,
@@ -968,10 +980,11 @@ pub fn other_action(config: &Config, _state: &Arc<RwLock<State>>, font: &Font, l
 }
 
 fn shortcut_page(
-    state: &Arc<RwLock<State>>,
+    state: Arc<RwLock<State>>,
     font: &Font,
     lo: LogOptions,
     last_output_dir: Option<String>,
+    timers: &UiTimers,
 ) -> Box<dyn AsWidget> {
     let (mut widget, mut layout) = page();
     if let Some(last_output_dir) = last_output_dir {
@@ -979,13 +992,13 @@ fn shortcut_page(
     }
     let name_field = add_field(
         &mut layout,
-        state,
+        state.clone(),
         |state| &mut state.shortcut_name,
         "Shortcut name",
         font,
     );
 
-    let state_for_folder = Arc::clone(state);
+    let state_for_folder = Arc::clone(&state);
     let folder_button = Rc::new(RefCell::new(
         PushButton::new(format!(
             "Output directory: {}",
@@ -1012,18 +1025,18 @@ fn shortcut_page(
     folder_button.borrow().set_font(font);
     layout.add_widget(Box::new(SharedButton(Rc::clone(&folder_button))));
 
-    let state_for_action = Arc::clone(state);
+    let state_for_action = Arc::clone(&state);
     let name_for_action = Rc::clone(&name_field);
     let action = Rc::new(RefCell::new(
         PushButton::new("Create shortcut")
             .on_clicked(move || {
                 let name = sync_field(
                     &name_for_action,
-                    &state_for_action,
+                    state_for_action.clone(),
                     |state| &mut state.shortcut_name,
                 );
                 let output_dir = state_for_action.read().unwrap().output_dir.clone();
-                run_command(crate::Cmds::Shortcut {
+                run_command(state_for_action.clone(), crate::Cmds::Shortcut {
                     name,
                     output_dir: (!output_dir.is_empty()).then_some(output_dir.into()),
                 }, lo, false);
@@ -1047,7 +1060,7 @@ fn shortcut_page(
             }
         })
         .build();
-    std::mem::forget(timer);
+    timers.borrow_mut().push(timer);
     layout.add_widget(Box::new(SharedButton(action)));
 
     layout.add_spacer(Spacer::vertical_expanding());
@@ -1056,7 +1069,7 @@ fn shortcut_page(
     Box::new(widget)
 }
 
-fn directory_button(c: &Config, font: &Font, lo: LogOptions) -> Rc<RefCell<PushButton>> {
+fn directory_button(state: Arc<RwLock<State>>, c: &Config, font: &Font) -> Rc<RefCell<PushButton>> {
     let directory = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .to_string_lossy()
@@ -1065,6 +1078,7 @@ fn directory_button(c: &Config, font: &Font, lo: LogOptions) -> Rc<RefCell<PushB
         PushButton::new(format!("Working folder: {directory}"))
             .on_clicked({
                 let last_directory = c.last_directory.clone().unwrap_or(directory);
+                let state: Arc<RwLock<State>> = Arc::clone(&state);
                 move || {
                     if let Some(folder) = FileDialog::select_directory(
                         None,
@@ -1081,8 +1095,7 @@ fn directory_button(c: &Config, font: &Font, lo: LogOptions) -> Rc<RefCell<PushB
                             error_box(format!("Unable to open selected folder: {error}"));
                             return;
                         }
-                        let _ = lo;
-                        restart(0);
+                        restart(Arc::clone(&state));
                     }
                 }
             })
@@ -1104,29 +1117,23 @@ impl AsWidget for SharedStack {
     }
 }
 
-pub fn run(c: &Config, lo: LogOptions) {
-    println!("{:#?}", lo);
-    let state = Arc::new(RwLock::new(State::default()));
+fn main_content(
+    state: Arc<RwLock<State>>,
+    c: &Config,
+    lo: LogOptions,
+    output_view: Rc<RefCell<Rc<RefCell<TextBrowser>>>>,
+    timers: &UiTimers,
+) -> Widget {
     let font = Font::new().point_size(20).build();
-    let output = Arc::new(Mutex::new(String::new()));
-    let output_for_sink = Arc::clone(&output);
-    set_log_sink(Some(Arc::new(move |chunk| {
-        append_output(&mut output_for_sink.lock().unwrap(), chunk);
-    })));
-
-    let app = Application::new();
-    app.set_icon("assets/plg.png");
-
-    let window = MainWindow::new().window_title("Playlist with Git").build();
-
+    let output_view = Rc::clone(&output_view.borrow());
     let stack = Rc::new(RefCell::new(StackedWidget::new().build()));
     let page_selector = SharedComboBox(Rc::new(RefCell::new(ComboBox::new().build())));
     let pages = [
-        ("Play", run_ui(c, &load_local_config().unwrap_or_default(), &state, &font, lo, Rc::clone(&page_selector.0))),
+        ("Play", run_ui(c, &load_local_config().unwrap_or_default(), state.clone(), &font, lo, Rc::clone(&page_selector.0), timers)),
         (
             "Download and push",
             other(
-                &state,
+                state.clone(),
                 "Download and push",
                 crate::Cmds::Add {
                     no_update: false,
@@ -1138,34 +1145,37 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Download",
             other(
-                &state,
+                state.clone(),
                 "Download",
                 crate::Cmds::Download { url: String::new() },
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Update",
             other(
-                &state,
+                state.clone(),
                 "Update",
                 crate::Cmds::Update { force: false },
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Push",
             other(
-                &state,
+                state.clone(),
                 "Push",
                 crate::Cmds::Push {
                     no_update: false,
@@ -1176,12 +1186,13 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Initialize",
             other(
-                &state,
+                state.clone(),
                 "Initialize",
                 crate::Cmds::Init {
                     name: None,
@@ -1192,12 +1203,13 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Configure globally",
             other(
-                &state,
+                state.clone(),
                 "Configure",
                 crate::Cmds::Cfg {
                     default_player: None,
@@ -1208,12 +1220,13 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Configure locally",
             other(
-                &state,
+                state.clone(),
                 "Configure locally",
                 crate::Cmds::CfgLocal {
                     default_player: None,
@@ -1224,12 +1237,13 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 true,
+                timers,
             ),
         ),
         (
             "Reset globally",
             other(
-                &state,
+                state.clone(),
                 "Reset selected",
                 crate::Cmds::Reset {
                     default_player: false,
@@ -1239,12 +1253,13 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 false,
+                timers,
             ),
         ),
         (
             "Reset locally",
             other(
-                &state,
+                state.clone(),
                 "Reset selected locally",
                 crate::Cmds::ResetLocal {
                     default_player: false,
@@ -1254,12 +1269,13 @@ pub fn run(c: &Config, lo: LogOptions) {
                 &font,
                 lo,
                 true,
+                timers,
             ),
         ),
-        ("Shortcut", shortcut_page(&state, &font, lo, c.last_output_dir.clone())),
+        ("Shortcut", shortcut_page(state.clone(), &font, lo, c.last_output_dir.clone(), timers)),
         (
             "Other...",
-            other_action(c, &state, &font, lo),
+            other_action(c, state.clone(), &font, lo),
         ),
     ];
     let page_names: Vec<&str> = pages.iter().map(|(name, _)| *name).collect();
@@ -1276,26 +1292,13 @@ pub fn run(c: &Config, lo: LogOptions) {
     });
     page_selector.set_font(&font);
 
-    let output_view = Rc::new(RefCell::new(TextBrowser::new().build()));
-    output_view.borrow().set_font(&Font::new().point_size(12).build());
-    output_view.borrow().set_open_links(false);
-    let output_for_timer = Arc::clone(&output);
-    let output_view_for_timer = Rc::downgrade(&output_view);
-    let output_timer = Timer::new(50)
-        .on_timeout(move || {
-            let text = output_for_timer.lock().unwrap().clone();
-            if let Some(output_view) = output_view_for_timer.upgrade() {
-                if output_view.borrow().plain_text() != text {
-                    output_view.borrow().set_plain_text(&text);
-                }
-            }
-        })
-        .build();
-    std::mem::forget(output_timer);
-
     let mut central = Widget::new().build();
     let mut layout = VBoxLayout::new();
-    layout.add_widget(Box::new(SharedButton(directory_button(c, &font, lo))));
+    layout.add_widget(Box::new(SharedButton(directory_button(
+        state.clone(),
+        c,
+        &font,
+    ))));
     if repo().is_err() {
         let warning = Label::new("Warning: the current directory is not a Git repository.").build();
         warning.set_font(&Font::new().point_size(14).bold(true).build());
@@ -1306,9 +1309,113 @@ pub fn run(c: &Config, lo: LogOptions) {
     layout.add(SharedTextBrowser(Rc::clone(&output_view)));
     central.set_layout(&layout);
     std::mem::forget(layout);
+    central
+}
 
-    window.set_central_widget(&central);
-    window.show();
+pub fn run(app: Arc<RwLock<Application>>, state: Arc<RwLock<State>>, c: &Config, lo: LogOptions) -> i32 {
+    let output = Arc::new(Mutex::new(String::new()));
+    let output_for_sink = Arc::clone(&output);
+    set_log_sink(Some(Arc::new(move |chunk| {
+        append_output(&mut output_for_sink.lock().unwrap(), chunk);
+    })));
 
-    app.exec();
+    match app_icon_path() {
+        Ok(icon_path) => app
+            .read()
+            .unwrap()
+            .set_icon(&icon_path.to_string_lossy()),
+        Err(error) => {
+            error_box(error)
+        },
+    }
+
+    let window = Rc::new(RefCell::new(
+        MainWindow::new().window_title("Playlist with Git").build(),
+    ));
+    let create_output_view = || {
+        let output_view = Rc::new(RefCell::new(TextBrowser::new().build()));
+        output_view.borrow().set_font(&Font::new().point_size(12).build());
+        output_view.borrow().set_open_links(false);
+        output_view
+    };
+    let output_view = Rc::new(RefCell::new(create_output_view()));
+
+    let output_for_timer = Arc::clone(&output);
+    let output_view_for_timer = Rc::clone(&output_view);
+    let output_timer = Timer::new(50)
+        .on_timeout(move || {
+            let text = output_for_timer.lock().unwrap().clone();
+            let output_view = Rc::clone(&output_view_for_timer.borrow());
+            if output_view.borrow().plain_text() != text {
+                output_view.borrow().set_plain_text(&text);
+            }
+        })
+        .build();
+
+    let current_timers: UiTimers = Rc::new(RefCell::new(Vec::new()));
+    let mut central = main_content(
+        Arc::clone(&state),
+        c,
+        lo,
+        Rc::clone(&output_view),
+        &current_timers,
+    );
+    central.set_has_parent();
+    window.borrow().set_central_widget(&central);
+    std::mem::forget(central);
+    window.borrow().show();
+
+    let window_for_refresh = Rc::clone(&window);
+    let timers_for_refresh = Rc::clone(&current_timers);
+    let output_view_for_refresh = Rc::clone(&output_view);
+    let refresh_timer = Timer::new(50)
+        .on_timeout(move || {
+            let restart_requested = {
+                let mut state = state.write().unwrap();
+                std::mem::take(&mut state.restart_requested)
+            };
+            if !restart_requested {
+                return;
+            }
+
+            let config = match load_config() {
+                Ok(config) => config,
+                Err(error) => {
+                    error_box(format!("Unable to reload configuration: {error}"));
+                    return;
+                }
+            };
+            if let Some(directory) = config.last_directory.as_deref() {
+                if std::path::Path::new(directory).is_dir() {
+                    if let Err(error) = std::env::set_current_dir(directory) {
+                        error_box(format!("Unable to open configured folder: {error}"));
+                    }
+                }
+            }
+            let previous_timers =
+                std::mem::take(&mut *timers_for_refresh.borrow_mut());
+            drop(previous_timers);
+
+            let output_view = create_output_view();
+            *output_view_for_refresh.borrow_mut() = output_view;
+            let mut central = main_content(
+                Arc::clone(&state),
+                &config,
+                lo,
+                Rc::clone(&output_view_for_refresh),
+                &timers_for_refresh,
+            );
+            central.set_has_parent();
+            window_for_refresh.borrow().set_central_widget(&central);
+            std::mem::forget(central);
+        })
+        .build();
+
+    let exit_code = app.read().unwrap().exec();
+    drop(refresh_timer);
+    drop(current_timers);
+    drop(output_timer);
+    drop(output_view);
+    drop(window);
+    exit_code
 }
