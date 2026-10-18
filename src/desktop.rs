@@ -155,6 +155,7 @@ fn app_icon_path() -> Result<PathBuf, std::io::Error> {
     for directory in executable_dir.ancestors() {
         for candidate in [
             directory.join("assets").join(icon_name),
+            directory.join("lib").join("plg-qt").join("assets").join(icon_name),
             directory.join(icon_name),
         ] {
             if candidate.is_file() {
